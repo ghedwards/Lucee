@@ -121,6 +121,12 @@ public final class PageImpl extends BodyBase implements Page {
 	// Maximum keys per <cinit> helper method to avoid JVM's 64KB method bytecode limit, each key generates ~30 bytes
 	private static final int MAX_KEYS_PER_CINIT_METHOD = 1000;
 
+	private static final int MAX_UDF_PER_CALL_METHOD = 10;
+	// Maximum cumulative statements across UDFs in a single udfCall helper method
+	private static final int MAX_STATEMENTS_PER_CALL_METHOD = 200;
+
+
+
 	public static final Type NULL = Type.getType(lucee.runtime.type.Null.class);
 	public static final Type KEY_IMPL = Type.getType(KeyImpl.class);
 	public static final Type KEY_CONSTANTS = Type.getType(KeyConstants.class);
@@ -576,68 +582,80 @@ public final class PageImpl extends BodyBase implements Page {
 		ConditionVisitor cv;
 		DecisionIntVisitor div;
 		// Function[] functions = extractFunctions(constr.getUDFProperties());
-		// less/equal than 10 functions
+		
 		if (isInterface()) {}
-		else if (functions.length <= 10) {
-			adapter = new GeneratorAdapter(Opcodes.ACC_PUBLIC + Opcodes.ACC_FINAL, UDF_CALL, null, new Type[] { Types.THROWABLE }, cw);
-			BytecodeContext bc = new BytecodeContext(config, optionalPS, constr, this, keys, cw, className, adapter, UDF_CALL, writeLog(), suppressWSbeforeArg, output, returnValue,
-					sourceCode.getSourceOffset());
-
-			if (functions.length == 0) {}
-			else if (functions.length == 1) {
-				bc.visitLine(functions[0].getStart());
-				functions[0].getBody().writeOut(bc);
-				bc.visitLine(functions[0].getEnd());
-			}
-			else writeOutUdfCallInner(bc, functions, 0, functions.length);
-			adapter.visitInsn(Opcodes.ACONST_NULL);
-			adapter.returnValue();
-			adapter.endMethod();
-		}
-		// more than 10 functions
 		else {
-			adapter = new GeneratorAdapter(Opcodes.ACC_PUBLIC + Opcodes.ACC_FINAL, UDF_CALL, null, new Type[] { Types.THROWABLE }, cw);
-			BytecodeContext bc = new BytecodeContext(config, optionalPS, constr, this, keys, cw, className, adapter, UDF_CALL, writeLog(), suppressWSbeforeArg, output, returnValue,
-					sourceCode.getSourceOffset());
-			cv = new ConditionVisitor();
-			cv.visitBefore();
-			int count = 0;
-			for (int i = 0; i < functions.length; i += 10) {
-				cv.visitWhenBeforeExpr();
-				div = new DecisionIntVisitor();
-				div.visitBegin();
-				adapter.loadArg(2);
-				div.visitLT();
-				adapter.push(i + 10);
-				div.visitEnd(bc);
-				cv.visitWhenAfterExprBeforeBody(bc);
+			// Calculate batches based on both UDF count and statement count
+			List<int[]> batches = calculateUdfCallBatches(functions, MAX_UDF_PER_CALL_METHOD, MAX_STATEMENTS_PER_CALL_METHOD);
+			
+			if (batches.size() == 1 && batches.get(0)[1] - batches.get(0)[0] <= 1) {
+				// Single function or empty - inline
+				adapter = new GeneratorAdapter(Opcodes.ACC_PUBLIC + Opcodes.ACC_FINAL, UDF_CALL, null, new Type[] { Types.THROWABLE }, cw);
+				BytecodeContext bc = new BytecodeContext(config, optionalPS, constr, this, keys, cw, className, adapter, UDF_CALL, writeLog(), suppressWSbeforeArg, output, returnValue,
+						sourceCode.getSourceOffset());
 
-				adapter.visitVarInsn(Opcodes.ALOAD, 0);
-				adapter.visitVarInsn(Opcodes.ALOAD, 1);
-				adapter.visitVarInsn(Opcodes.ALOAD, 2);
-				adapter.visitVarInsn(Opcodes.ILOAD, 3);
-				adapter.visitMethodInsn(Opcodes.INVOKEVIRTUAL, className, createFunctionName(++count), "(Llucee/runtime/PageContext;Llucee/runtime/type/UDF;I)Ljava/lang/Object;");
-				adapter.visitInsn(Opcodes.ARETURN);// adapter.returnValue();
-				cv.visitWhenAfterBody(bc);
+				if (functions.length == 0) {}
+				else if (functions.length == 1) {
+					bc.visitLine(functions[0].getStart());
+					functions[0].getBody().writeOut(bc);
+					bc.visitLine(functions[0].getEnd());
+				}
+				else writeOutUdfCallInner(bc, functions, 0, functions.length);
+				adapter.visitInsn(Opcodes.ACONST_NULL);
+				adapter.returnValue();
+				adapter.endMethod();
 			}
-			cv.visitAfter(bc);
+			else {
+				// Multiple batches - use helper methods
+				adapter = new GeneratorAdapter(Opcodes.ACC_PUBLIC + Opcodes.ACC_FINAL, UDF_CALL, null, new Type[] { Types.THROWABLE }, cw);
+				BytecodeContext bc = new BytecodeContext(config, optionalPS, constr, this, keys, cw, className, adapter, UDF_CALL, writeLog(), suppressWSbeforeArg, output, returnValue,
+						sourceCode.getSourceOffset());
+				cv = new ConditionVisitor();
+				cv.visitBefore();
+				
+				for (int batchIdx = 0; batchIdx < batches.size(); batchIdx++) {
+					int[] batch = batches.get(batchIdx);
+					int startIdx = batch[0];
+					int endIdx = batch[1];
+					
+					cv.visitWhenBeforeExpr();
+					div = new DecisionIntVisitor();
+					div.visitBegin();
+					adapter.loadArg(2);
+					div.visitLT();
+					adapter.push(endIdx);
+					div.visitEnd(bc);
+					cv.visitWhenAfterExprBeforeBody(bc);
 
-			adapter.visitInsn(Opcodes.ACONST_NULL);
-			adapter.returnValue();
-			adapter.endMethod();
-
-			count = 0;
-			Method innerCall;
-			for (int i = 0; i < functions.length; i += 10) {
-				innerCall = new Method(createFunctionName(++count), Types.OBJECT, new Type[] { Types.PAGE_CONTEXT, USER_DEFINED_FUNCTION, Types.INT_VALUE });
-
-				adapter = new GeneratorAdapter(Opcodes.ACC_PRIVATE + Opcodes.ACC_FINAL, innerCall, null, new Type[] { Types.THROWABLE }, cw);
-				writeOutUdfCallInner(new BytecodeContext(config, optionalPS, constr, this, keys, cw, className, adapter, innerCall, writeLog(), suppressWSbeforeArg, output,
-						returnValue, sourceCode.getSourceOffset()), functions, i, i + 10 > functions.length ? functions.length : i + 10);
+					adapter.visitVarInsn(Opcodes.ALOAD, 0);
+					adapter.visitVarInsn(Opcodes.ALOAD, 1);
+					adapter.visitVarInsn(Opcodes.ALOAD, 2);
+					adapter.visitVarInsn(Opcodes.ILOAD, 3);
+					adapter.visitMethodInsn(Opcodes.INVOKEVIRTUAL, className, createFunctionName(batchIdx + 1), "(Llucee/runtime/PageContext;Llucee/runtime/type/UDF;I)Ljava/lang/Object;");
+					adapter.visitInsn(Opcodes.ARETURN);
+					cv.visitWhenAfterBody(bc);
+				}
+				cv.visitAfter(bc);
 
 				adapter.visitInsn(Opcodes.ACONST_NULL);
 				adapter.returnValue();
 				adapter.endMethod();
+
+				// Generate helper methods for each batch
+				for (int batchIdx = 0; batchIdx < batches.size(); batchIdx++) {
+					int[] batch = batches.get(batchIdx);
+					int startIdx = batch[0];
+					int endIdx = batch[1];
+					
+					Method innerCall = new Method(createFunctionName(batchIdx + 1), Types.OBJECT, new Type[] { Types.PAGE_CONTEXT, USER_DEFINED_FUNCTION, Types.INT_VALUE });
+					adapter = new GeneratorAdapter(Opcodes.ACC_PRIVATE + Opcodes.ACC_FINAL, innerCall, null, new Type[] { Types.THROWABLE }, cw);
+					writeOutUdfCallInner(new BytecodeContext(config, optionalPS, constr, this, keys, cw, className, adapter, innerCall, writeLog(), suppressWSbeforeArg, output,
+							returnValue, sourceCode.getSourceOffset()), functions, startIdx, endIdx);
+
+					adapter.visitInsn(Opcodes.ACONST_NULL);
+					adapter.returnValue();
+					adapter.endMethod();
+				}
 			}
 		}
 
@@ -1053,6 +1071,37 @@ public final class PageImpl extends BodyBase implements Page {
 			cv.visitWhenAfterBody(bc);
 		}
 		cv.visitAfter(bc);
+	}
+
+	/**
+	 * Calculate batches for UDF_CALL based on both UDF count and cumulative statement count
+	 */
+	private static List<int[]> calculateUdfCallBatches(Function[] functions, int maxUdfsPerBatch, int maxStatementsPerBatch) {
+		List<int[]> batches = new ArrayList<>();
+		int batchStart = 0;
+		int cumulativeStatements = 0;
+		
+		for (int i = 0; i < functions.length; i++) {
+			int stmtCount = functions[i].getBody().getStatements().size();
+			int udfCount = i - batchStart + 1;
+			
+			// Check if adding this function would exceed limits
+			if (udfCount > maxUdfsPerBatch || (cumulativeStatements + stmtCount > maxStatementsPerBatch && udfCount > 1)) {
+				// Close current batch
+				batches.add(new int[] { batchStart, i });
+				batchStart = i;
+				cumulativeStatements = stmtCount;
+			} else {
+				cumulativeStatements += stmtCount;
+			}
+		}
+		
+		// Add final batch
+		if (batchStart < functions.length) {
+			batches.add(new int[] { batchStart, functions.length });
+		}
+		
+		return batches;
 	}
 
 	private void writeOutUdfCallInner(BytecodeContext bc, Function[] functions, int offset, int length) throws TransformerException {
